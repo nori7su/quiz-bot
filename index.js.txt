@@ -1,0 +1,126 @@
+const { 
+    Client, 
+    GatewayIntentBits, 
+    ActionRowBuilder, 
+    ButtonBuilder, 
+    ButtonStyle, 
+    EmbedBuilder 
+} = require('discord.js');
+const { google } = require('googleapis');
+
+// 1. Discordクライアントの初期化
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+// 2. Google Sheets APIの認証設定（環境変数から読み込み）
+const auth = new google.auth.JWT(
+    process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    null,
+    process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'), // Renderの環境変数対策
+    ['https://www.googleapis.com/auth/spreadsheets']
+);
+const sheets = google.sheets({ version: 'v4', auth });
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}!`);
+});
+
+// カレントのクイズID（実際は日付や出題ロジックと連動させます）
+const CURRENT_QUIZ_ID = "20260614"; 
+
+// 3. 投票ボタンを押したときのインタラクション処理
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isButton()) return;
+
+    // ボタンのカスタムIDのフォーマット: "quiz_[カテゴリー]_[選択肢]"
+    // 例: quiz_nikkei_up
+    if (!interaction.customId.startsWith('quiz_')) return;
+
+    await interaction.deferReply({ ephemeral: true }); // 「考え中...」にし、本人にのみ見える設定
+
+    const [_, categoryKey, voteValueKey] = interaction.customId.split('_');
+    
+    // キーを日本語にマッピング
+    const categories = { nikkei: '①日経平均', fx: '②ドル/円', dow: '③NYダウ' };
+    const voteValues = { up: '上がる', stay: '同じ', down: '下がる' };
+
+    const category = categories[categoryKey];
+    const voteValue = voteValues[voteValueKey];
+    const userId = interaction.user.id;
+    const questionId = `${CURRENT_QUIZ_ID}_${categoryKey}`;
+
+    try {
+        // --- A. 多重投票チェック & 全データ取得 ---
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId: SPREADSHEET_ID,
+            range: '投票ログ!A2:E', // 2行目以降のデータをすべて取得
+        });
+
+        const rows = response.data.values || [];
+        
+        // 既にこの問題（questionId）にこのユーザー（userId）が投票しているか確認
+        const hasVoted = rows.some(row => row[1] === questionId && row[3] === userId);
+
+        if (hasVoted) {
+            return await interaction.editReply({ 
+                content: `⚠️ すでにこの問題（${category}）には投票済みです。変更や再投票はできません。` 
+            });
+        }
+
+        // --- B. Google Sheetsへ投票データを追加（Append） ---
+        const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: SPREADSHEET_ID,
+            range: '投票ログ!A:E',
+            valueInputOption: 'USER_ENTERED',
+            requestBody: {
+                values: [[now, questionId, category, userId, voteValue]]
+            }
+        });
+
+        // データを追加した後の最新ログに今回の投票をダミー追加して比率計算へ（API節約のため）
+        rows.push([now, questionId, category, userId, voteValue]);
+
+        // --- C. リアルタイム投票比率の計算 ---
+        // この問題に対する各選択肢の票数をカウント
+        const currentQuizRows = rows.filter(row => row[1] === questionId);
+        const totalVotes = currentQuizRows.length;
+        
+        const counts = { '上がる': 0, '同じ': 0, '下がる': 0 };
+        currentQuizRows.forEach(row => {
+            if (counts[row[4]] !== undefined) counts[row[4]]++;
+        });
+
+        // パーセンテージバーを作る関数
+        const makeBar = (count, total) => {
+            if (total === 0) return '░░░░░░░░░░ 0%';
+            const percentage = Math.round((count / total) * 100);
+            const barLength = Math.round(percentage / 10); // 10マスのバー
+            const filled = '█'.repeat(barLength);
+            const empty = '░'.repeat(10 - barLength);
+            return `${filled}${empty} ${percentage}% (${count}票)`;
+        };
+
+        // --- D. 結果の返信 ---
+        const embed = new EmbedBuilder()
+            .setTitle(`🎉 投票を受け付けました！ [${category}]`)
+            .setDescription(`あなたの予想: **${voteValue}**\n\n📊 **現在のコミュニティの投票比率**`)
+            .addFields(
+                { name: '⬆️ 上がる', value: makeBar(counts['上がる'], totalVotes) },
+                { name: '➡️ 同じ', value: makeBar(counts['同じ'], totalVotes) },
+                { name: '⬇️ 下がる', value: makeBar(counts['下がる'], totalVotes) }
+            )
+            .setColor('#0099ff')
+            .setFooter({ text: `総投票数: ${totalVotes}票` })
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [embed] });
+
+    } catch (error) {
+        console.error('Error interacting with Google Sheets:', error);
+        await interaction.editReply({ content: '❌ データの保存中にエラーが発生しました。時間をおいて再度お試しください。' });
+    }
+});
+
+// ボットのログイン
+client.login(process.env.DISCORD_TOKEN);
